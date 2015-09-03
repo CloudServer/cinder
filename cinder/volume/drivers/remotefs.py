@@ -114,9 +114,12 @@ class RemoteFSDriver(driver.VolumeDriver):
 
         LOG.info(_('casted to %s') % volume['provider_location'])
 
-        self._do_create_volume(volume)
+        ret = self._do_create_volume(volume)
+        if not ret:
+            ret = {}
+        ret['provider_location'] = volume['provider_location']
 
-        return {'provider_location': volume['provider_location']}
+        return ret
 
     def _do_create_volume(self, volume):
         """Create a volume on given remote share.

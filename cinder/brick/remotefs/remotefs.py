@@ -18,6 +18,7 @@
 import hashlib
 import os
 import re
+import tempfile
 
 import six
 
@@ -227,4 +228,3 @@ class RemoteFsClient(object):
 
         self._execute(*mnt_cmd, root_helper=self.root_helper,
                       run_as_root=True, check_exit_code=0)
-

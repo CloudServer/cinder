@@ -48,6 +48,11 @@ vzstorage_opts = [
                  help=('Percent of ACTUAL usage of the underlying volume '
                        'before no new volumes can be allocated to the volume '
                        'destination.')),
+    cfg.StrOpt('vzstorage_default_volume_format',
+               default='parallels',
+               help=('Default format that will be used when creating volumes '
+                     'if no volume format is specified. Can be set to: '
+                     'raw, parallels, qcow2.')),
     cfg.StrOpt('vzstorage_mount_point_base',
                default='$state_path/mnt',
                help=('Base dir containing mount points for '
@@ -61,6 +66,54 @@ vzstorage_opts = [
 
 CONF = cfg.CONF
 CONF.register_opts(vzstorage_opts)
+
+
+class PloopImgInfo(object):
+    DELTA_REGEX = "Opening delta (.*)"
+    SIZE_REGEX = "size:\s+(\d+)"
+    BLOCKSIZE_REGEX = "blocksize:\s+(\d+)"
+    SECTOR_SIZE = 512
+
+    def __init__(self, image_path, execute):
+        self._execute = execute
+        info = self._get_info(image_path)
+
+        self.image = info.get("image_file")
+        self.backing_file = None
+        self.file_format = "parallels"
+        self.virtual_size = info.get("virtual_size")
+        self.cluster_size = info.get("cluster_size")
+        self.disk_size = info.get("disk_size")
+        self.snapshots = []
+        self.encrypted = False
+
+    def _get_info(self, image_path):
+        dd_path = os.path.join(image_path, "DiskDescriptor.xml")
+        out, err = self._execute("ploop", "info", "-s", dd_path,
+                                 run_as_root=True, check_exit_code=True)
+        err_msg = "Invalid ploop output: %r" % out
+        ret = {}
+
+        m = re.search(self.DELTA_REGEX, out)
+        if not m:
+            raise exception.VzStorageException(err_msg)
+        image_file = m.group(1)
+        st = os.stat(image_file)
+        ret["size"] = st.st_blocks * st.st_blksize
+        ret["image_file"] = image_file
+
+        m = re.search(self.SIZE_REGEX, out)
+        if not m:
+            raise exception.VzStorageException(err_msg)
+        ret["virtual_size"] = int(m.group(1)) * self.SECTOR_SIZE
+
+        m = re.search(self.BLOCKSIZE_REGEX, out)
+        if not m:
+            raise exception.VzStorageException(err_msg)
+        ret["blocksize"] = int(m.group(1)) * self.SECTOR_SIZE
+
+        return ret
+
 
 class VZStorageDriver(remotefs_drv.RemoteFSSnapDriver):
     """Cinder driver for Virtuozzo Storage.
@@ -107,10 +160,10 @@ class VZStorageDriver(remotefs_drv.RemoteFSSnapDriver):
         """
         # Find active image
         active_file = self.get_active_image_from_info(volume)
-        active_file_path = os.path.join(self._local_volume_dir(volume),
-                                        active_file)
-        info = self._qemu_img_info(active_file_path, volume['name'])
-        fmt = info.file_format
+
+        fmt = self._get_volume_format(volume)
+        if fmt == "parallels":
+            fmt = "ploop"
 
         data = {'export': volume['provider_location'],
                 'format': fmt,
@@ -225,20 +278,99 @@ class VZStorageDriver(remotefs_drv.RemoteFSSnapDriver):
 
         return True
 
-    def extend_volume(self, volume, size_gb):
-        LOG.info(_LI('Extending volume %s.'), volume['id'])
-        self._extend_volume(volume, size_gb)
+    def _get_volume_format(self, volume):
+        """Get volume format from volume object's metadata.
+        Should be called for existing volumes only.
+        """
 
-    def _extend_volume(self, volume, size_gb):
+        specs = volume.get('volume_metadata') or []
+        for spec in specs:
+            if spec.key == 'volume_format':
+                return spec.value
+        else:
+            msg = "Volume format is not specified."
+            raise exception.VzStorageException(msg)
+
+    def _choose_volume_format(self, volume):
+        """Chooses volume format for a new volume from (sorted by priority):
+
+        1. 'volume_format' in volume's metadata
+        2. 'volume_format' in volume type extra specs
+        3. vzstorage_default_volume_format config option.
+        """
+
+        extra_specs = []
+
+        metadata_specs = volume.get('volume_metadata') or []
+        extra_specs += metadata_specs
+
+        vol_type = volume.get('volume_type')
+        if vol_type:
+            volume_type_specs = vol_type.get('extra_specs') or []
+            extra_specs += volume_type_specs
+
+        for spec in extra_specs:
+            if 'volume_format' in spec.key:
+                return spec.value
+        else:
+                return self.configuration.vzstorage_default_volume_format
+
+    def _ploop_file(self):
+        return "root.hds"
+
+    def _create_ploop_image(self, volume_path, volume_size):
+        os.mkdir(volume_path)
+        image_path = os.path.join(volume_path, self._ploop_file())
+        self._execute("ploop", "init", "-s", "%dG" % volume_size, image_path)
+
+    def _do_create_volume(self, volume):
+        """Create a volume on given remote share.
+
+        :param volume: volume reference
+        """
+        volume_format = self._choose_volume_format(volume)
+        volume_path = self.local_path(volume)
+        volume_size = volume['size']
+
+        if os.path.exists(volume_path):
+            msg = _('File already exists at %s.') % volume_path
+            LOG.error(msg)
+            raise exception.InvalidVolume(reason=msg)
+
+        if volume_format == "parallels":
+            self._create_ploop_image(volume_path, volume_size)
+        elif volume_format == "raw":
+            if getattr(self.configuration,
+                       self.driver_prefix + '_sparsed_volumes'):
+                self._create_sparsed_file(volume_path, volume_size)
+            else:
+                self._create_regular_file(volume_path, volume_size)
+        else:
+            msg = "Unsupported volume format: %s" % volume_format
+            raise exception.VzStorageException(msg)
+
+        self._set_rw_permissions_for_all(volume_path)
+        return {"metadata": {"volume_format": volume_format}}
+
+    def extend_volume(self, volume, size_gb):
         volume_path = self.local_path(volume)
 
+        LOG.info(_LI('Extending volume %s.'), volume['id'])
         self._check_extend_volume_support(volume, size_gb)
         LOG.info(_LI('Resizing file to %sG...'), size_gb)
 
-        self._do_extend_volume(volume_path, size_gb)
+        volume_format = self._get_volume_format(volume)
+        self._do_extend_volume(volume_path, size_gb, volume_format)
 
-    def _do_extend_volume(self, volume_path, size_gb):
-        image_utils.resize_image(volume_path, size_gb)
+    def _do_extend_volume(self, volume_path, size_gb, volume_format):
+        if volume_format == "parallels":
+            self._execute('prl_disk_tool', 'resize', '--size',
+                          '%dG' % size_gb, '--resize_partition',
+                          '--hdd', volume_path,
+                          run_as_root=True)
+            volume_path = os.path.join(volume_path, self._ploop_file())
+        else:
+            image_utils.resize_image(volume_path, size_gb)
 
         if not self._is_file_size_equal(volume_path, size_gb):
             raise exception.ExtendVolumeError(
@@ -304,6 +436,11 @@ class VZStorageDriver(remotefs_drv.RemoteFSSnapDriver):
                                   out_format)
         self._extend_volume(volume, volume_size)
 
+    def _delete(self, path):
+        # Note(lpetrut): this method is needed in order to provide
+        # interoperability with Windows as it will be overridden.
+        self._execute('rm', '-rf', path, run_as_root=True)
+
     def delete_volume(self, volume):
         """Deletes a logical volume."""
         if not volume['provider_location']:
@@ -324,3 +461,28 @@ class VZStorageDriver(remotefs_drv.RemoteFSSnapDriver):
 
         info_path = self._local_path_volume_info(volume)
         self._delete(info_path)
+
+    def _recreate_ploop_desc(self, image_dir, image_file):
+        desc_path = os.path.join(image_dir, "DiskDescriptor.xml")
+        self._delete(desc_path)
+
+        self._execute("ploop", "restore-descriptor", image_dir, image_file)
+
+    def copy_image_to_volume(self, context, volume, image_service, image_id):
+        """Fetch the image from image_service and write it to the volume."""
+        volume_format = self._get_volume_format(volume)
+        image_path = self.local_path(volume)
+        if volume_format == "parallels":
+            image_path = os.path.join(image_path, self._ploop_file())
+
+        image_utils.fetch_to_volume_format(
+            context, image_service, image_id,
+            image_path, volume_format,
+            self.configuration.volume_dd_blocksize)
+
+        if volume_format == "parallels":
+            self._recreate_ploop_desc(self.local_path(volume), image_path)
+
+        self._do_extend_volume(self.local_path(volume),
+                               volume['size'],
+                               volume_format)
