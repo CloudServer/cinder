@@ -432,7 +432,7 @@ def _extract_attributes(image):
                         'container_format', 'status', 'id',
                         'name', 'created_at', 'updated_at',
                         'deleted', 'deleted_at', 'checksum',
-                        'min_disk', 'min_ram', 'is_public']
+                        'min_disk', 'min_ram', 'is_public', 'vm_mode']
     output = {}
 
     for attr in IMAGE_ATTRIBUTES:

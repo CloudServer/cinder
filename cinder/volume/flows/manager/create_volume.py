@@ -42,6 +42,7 @@ IMAGE_ATTRIBUTES = (
     'min_disk',
     'min_ram',
     'size',
+    'vm_mode'
 )
 
 
